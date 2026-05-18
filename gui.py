@@ -75,7 +75,10 @@ class WireBendGUI:
         ttk.Label(tb, text="Search half:").pack(side=tk.LEFT, padx=(10, 2))
         self.search_var = tk.IntVar(value=120)
         ttk.Spinbox(tb, from_=20, to=400, textvariable=self.search_var, width=4).pack(side=tk.LEFT)
-        self.snap_ball_var = tk.BooleanVar(value=True)
+        # OFF by default: the user is picking a specific point (often the
+        # wire tip just outside the ball), and Hough-circle tracking would
+        # otherwise drag the result back to the ball centre every frame.
+        self.snap_ball_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(tb, text="Snap track→ball", variable=self.snap_ball_var).pack(
             side=tk.LEFT, padx=(10, 0)
         )
@@ -256,14 +259,12 @@ class WireBendGUI:
 
         template_half = int(self.tmpl_var.get())
         search_half = int(self.search_var.get())
+        use_hough = bool(self.snap_ball_var.get())
         template_patch = None
         last_xy = tracked_pt_init.copy()
         rows: list[tuple[int, float, float | None, float | None, float | None]] = []
         last_log = time.time()
         idx = 0
-        n_hough = 0
-        n_ncc = 0
-        n_miss = 0
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -274,29 +275,36 @@ class WireBendGUI:
                 ex = analyzer.template_extract(gray, tracked_pt_init, template_half)
                 if ex is not None:
                     template_patch = ex[0]
-            # Hough-first robust track. Falls back to template NCC if Hough
-            # finds no circle. When NCC succeeds with high confidence we
-            # refresh the template so it adapts to slow appearance drift.
+            # Track the exact user-chosen point via NCC template matching
+            # with adaptive refresh. Only fall back to Hough-circle ball
+            # detection when the user explicitly asked to snap to the ball
+            # (otherwise the tracker would always drag to the ball centre
+            # even when the user picked the wire tip just outside the ball).
             tip = None
-            res = analyzer.track_step_robust(
-                gray, template_patch, last_xy, search_half=search_half,
-            )
-            if res is not None:
-                tip, method, score = res
-                last_xy = tip.copy()
-                if method == "hough":
-                    n_hough += 1
+            if use_hough:
+                res = analyzer.track_step_robust(
+                    gray, template_patch, last_xy, search_half=search_half,
+                )
+                if res is not None:
+                    tip, _, score = res
+                    last_xy = tip.copy()
                     ex = analyzer.template_extract(gray, tip, template_half)
                     if ex is not None:
                         template_patch = ex[0]
-                else:
-                    n_ncc += 1
+            elif template_patch is not None:
+                step = analyzer.template_track_step(
+                    gray, template_patch, last_xy, search_half,
+                )
+                if step is not None:
+                    tip, score = step
+                    last_xy = tip.copy()
+                    # Refresh template on high-confidence matches so the
+                    # tracker adapts to slow appearance changes (rotation,
+                    # lighting) as the wire bends.
                     if score > 0.85:
                         ex = analyzer.template_extract(gray, tip, template_half)
                         if ex is not None:
                             template_patch = ex[0]
-            else:
-                n_miss += 1
             angle = None
             if tip is not None:
                 angle = analyzer.polar_angle_from_fixed(fp, tip, axis_dir)
