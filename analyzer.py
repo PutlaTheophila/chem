@@ -861,33 +861,353 @@ def direction_angle_deg(v: np.ndarray) -> float:
     return float(np.degrees(np.arctan2(-v[1], v[0])))
 
 
-def annotate_frame(frame_bgr, pts, measurement, t_s, frame_idx):
+def detect_ball_hough(
+    gray: np.ndarray,
+    prior_xy: np.ndarray | None = None,
+    min_radius: int = 15,
+    max_radius: int = 60,
+    search_radius: float = 80.0,
+) -> np.ndarray | None:
+    """Detect the ball as a Hough circle. With ``prior_xy``, picks the circle
+    nearest the prior position within ``search_radius``; without, the
+    leftmost circle in the frame (the wire enters from the right, so the
+    free-end ball is the leftmost detected circle on the first frame).
+    Returns ``np.array([x, y, r])`` or ``None``."""
+    blur = cv2.GaussianBlur(gray, (5, 5), 1.5)
+    circles = cv2.HoughCircles(
+        blur, cv2.HOUGH_GRADIENT, dp=1.2, minDist=60,
+        param1=80, param2=20,
+        minRadius=min_radius, maxRadius=max_radius,
+    )
+    if circles is None:
+        return None
+    cands = circles[0]
+    if prior_xy is not None:
+        d = np.hypot(cands[:, 0] - prior_xy[0], cands[:, 1] - prior_xy[1])
+        i = int(np.argmin(d))
+        if d[i] > search_radius:
+            return None
+    else:
+        i = int(np.argmin(cands[:, 0]))
+    return np.array([float(cands[i, 0]), float(cands[i, 1]),
+                     float(cands[i, 2])], dtype=np.float64)
+
+
+def calibrate_fixed_point(
+    in_path: Path,
+    threshold: int = 130,
+    n_frames_check: int = 60,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Find the rod's rest geometry: the FIXED reference point (crystal at
+    rest, taken as the ball centre on the first valid frame) and the
+    REST-AXIS direction (anchor→FP unit vector, i.e. the rod's natural
+    straight-line direction in pixel coords — not assumed horizontal).
+
+    Returns ``(fp, axis_dir)`` or ``None`` if the ball can't be detected
+    in the first ``n_frames_check`` frames."""
+    cap = cv2.VideoCapture(str(in_path))
+    if not cap.isOpened():
+        return None
+    result = None
+    for _ in range(n_frames_check):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        mask = extract_wire_mask(frame, threshold)
+        if mask is None:
+            continue
+        right_col_ys = np.where(mask[:, -1] > 0)[0]
+        if len(right_col_ys) == 0:
+            continue
+        entry_y = float(np.mean(right_col_ys))
+        h, w = mask.shape
+        anchor = np.array([w - 1, entry_y], dtype=np.float64)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        ball = detect_ball_hough(gray)
+        if ball is None:
+            continue
+        fp = ball[:2].copy()
+        v = fp - anchor
+        nrm = float(np.linalg.norm(v))
+        if nrm < 10.0:
+            continue
+        axis_dir = v / nrm
+        result = (fp, axis_dir)
+        break
+    cap.release()
+    return result
+
+
+def signed_angle_from_axis(
+    axis_dir: np.ndarray,
+    v: np.ndarray,
+) -> float:
+    """Signed angle (degrees) from ``axis_dir`` to ``v`` in image coords.
+
+    Sign convention: with a leftward base direction, rotating the vector
+    UPWARD on screen yields a POSITIVE angle. Implemented via the 2D
+    cross/dot in image coords — sign(image_cross) inverts to match the
+    screen sense.
+
+    Returns 0.0 if ``v`` has negligible length."""
+    n_v = float(np.linalg.norm(v))
+    if n_v < 1e-6:
+        return 0.0
+    a = np.asarray(axis_dir, dtype=np.float64)
+    n_a = float(np.linalg.norm(a))
+    if n_a < 1e-9:
+        return 0.0
+    a = a / n_a
+    vn = np.asarray(v, dtype=np.float64) / n_v
+    dot = float(np.clip(a[0] * vn[0] + a[1] * vn[1], -1.0, 1.0))
+    cross = float(a[0] * vn[1] - a[1] * vn[0])
+    return float(np.degrees(np.arctan2(cross, dot)))
+
+
+def pick_geometry_interactive(
+    in_path: Path,
+    frame_index: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Open ``frame_index`` and let the user pick three points by mouse:
+      1. Fixed reference point (FP).
+      2. A second point along the desired reference axis (axis_dir is the
+         unit vector FP → this point).
+      3. The point on the moving structure to track over the video.
+
+    Keys: Enter = confirm, r = reset, q = cancel.
+    Returns ``(fp, axis_dir, tracked_pt_0)`` or ``None`` if cancelled."""
+    cap = cv2.VideoCapture(str(in_path))
+    if not cap.isOpened():
+        return None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return None
+
+    clicks: list[tuple[int, int]] = []
+
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(clicks) < 3:
+            clicks.append((int(x), int(y)))
+
+    window = "click: 1=FP  2=axis-end  3=track  |  Enter=ok  r=reset  q=quit"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window, on_mouse)
+    confirmed = False
+    while True:
+        disp = frame.copy()
+        labels = [("FP", (0, 255, 255)), ("axis", (180, 255, 180)),
+                  ("track", (80, 200, 255))]
+        for i, p in enumerate(clicks):
+            cv2.drawMarker(disp, p, labels[i][1], cv2.MARKER_CROSS, 22, 2)
+            cv2.putText(disp, labels[i][0], (p[0] + 10, p[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, labels[i][1], 2)
+        if len(clicks) >= 2:
+            cv2.line(disp, clicks[0], clicks[1], (180, 255, 180), 1)
+        if len(clicks) >= 3:
+            cv2.line(disp, clicks[0], clicks[2], (80, 200, 255), 1)
+        prompt = ["click FP", "click axis end", "click point to track",
+                  "Enter to confirm"][min(len(clicks), 3)]
+        cv2.rectangle(disp, (0, 0), (disp.shape[1], 28), (0, 0, 0), -1)
+        cv2.putText(disp, prompt, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255), 1)
+        cv2.imshow(window, disp)
+        key = cv2.waitKey(30) & 0xFF
+        if key == 13 and len(clicks) == 3:
+            confirmed = True
+            break
+        if key == ord("r"):
+            clicks = []
+        if key == ord("q"):
+            break
+    cv2.destroyAllWindows()
+    if not confirmed:
+        return None
+    fp = np.array(clicks[0], dtype=np.float64)
+    axis_end = np.array(clicks[1], dtype=np.float64)
+    track0 = np.array(clicks[2], dtype=np.float64)
+    v = axis_end - fp
+    nrm = float(np.linalg.norm(v))
+    if nrm < 1.0:
+        return None
+    axis_dir = v / nrm
+    return fp, axis_dir, track0
+
+
+def template_extract(
+    gray: np.ndarray,
+    center: np.ndarray,
+    half: int = 20,
+) -> tuple[np.ndarray, tuple[int, int]] | None:
+    """Extract a (2*half+1) square patch around ``center`` from ``gray``.
+    Returns ``(patch, (cx, cy))`` where (cx, cy) is the clipped centre, or
+    ``None`` if the centre is too close to the edge."""
+    h, w = gray.shape[:2]
+    cx, cy = int(round(float(center[0]))), int(round(float(center[1])))
+    if cx - half < 0 or cy - half < 0 or cx + half >= w or cy + half >= h:
+        return None
+    patch = gray[cy - half: cy + half + 1, cx - half: cx + half + 1].copy()
+    return patch, (cx, cy)
+
+
+def template_track_step(
+    gray: np.ndarray,
+    template: np.ndarray,
+    prior_xy: np.ndarray,
+    search_half: int = 80,
+) -> tuple[np.ndarray, float] | None:
+    """Find ``template`` in ``gray`` inside a window of half-size
+    ``search_half`` around ``prior_xy`` (normalised cross-correlation).
+    Returns ``(new_xy, score)`` where ``score`` is the NCC peak in
+    [-1, 1], or ``None`` if the search window is degenerate."""
+    h, w = gray.shape[:2]
+    th, tw = template.shape[:2]
+    px, py = int(round(float(prior_xy[0]))), int(round(float(prior_xy[1])))
+    x0 = max(0, px - search_half)
+    y0 = max(0, py - search_half)
+    x1 = min(w, px + search_half + tw)
+    y1 = min(h, py + search_half + th)
+    if x1 - x0 < tw + 2 or y1 - y0 < th + 2:
+        return None
+    roi = gray[y0:y1, x0:x1]
+    res = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
+    _, score, _, maxloc = cv2.minMaxLoc(res)
+    cx = x0 + maxloc[0] + tw / 2.0
+    cy = y0 + maxloc[1] + th / 2.0
+    return np.array([cx, cy], dtype=np.float64), float(score)
+
+
+def track_ball_in_roi(
+    gray: np.ndarray,
+    prior_xy: np.ndarray,
+    search_half: int = 80,
+    min_r: int = 12,
+    max_r: int = 60,
+    hough_param2: int = 18,
+) -> np.ndarray | None:
+    """Locate the ball via Hough circles inside a square ROI of half-size
+    ``search_half`` around ``prior_xy``. Returns the centre of the detected
+    circle closest to the prior position, or ``None`` if no circle is found.
+
+    A round bright ball is what Hough circles is designed for — far more
+    robust than template NCC against the bright wire next to the ball,
+    appearance changes, and motion blur."""
+    h, w = gray.shape[:2]
+    px, py = int(round(float(prior_xy[0]))), int(round(float(prior_xy[1])))
+    x0, y0 = max(0, px - search_half), max(0, py - search_half)
+    x1, y1 = min(w, px + search_half), min(h, py + search_half)
+    if x1 - x0 < 2 * min_r + 4 or y1 - y0 < 2 * min_r + 4:
+        return None
+    roi = gray[y0:y1, x0:x1]
+    blur = cv2.GaussianBlur(roi, (5, 5), 1.5)
+    circles = cv2.HoughCircles(
+        blur, cv2.HOUGH_GRADIENT, dp=1.2, minDist=40,
+        param1=80, param2=hough_param2,
+        minRadius=min_r, maxRadius=max_r,
+    )
+    if circles is None:
+        return None
+    cands = circles[0]
+    xs = cands[:, 0] + x0
+    ys = cands[:, 1] + y0
+    d = np.hypot(xs - px, ys - py)
+    i = int(np.argmin(d))
+    if d[i] > search_half:
+        return None
+    return np.array([float(xs[i]), float(ys[i])], dtype=np.float64)
+
+
+def track_step_robust(
+    gray: np.ndarray,
+    template: np.ndarray | None,
+    prior_xy: np.ndarray,
+    search_half: int = 120,
+    min_r: int = 12,
+    max_r: int = 60,
+) -> tuple[np.ndarray, str, float] | None:
+    """Robust per-frame tracker. Try Hough circles first (the ball IS a
+    circle), fall back to template NCC if Hough returns nothing.
+
+    Returns ``(xy, method, score)`` where ``method`` is "hough" or "ncc",
+    or ``None`` if both fail."""
+    xy = track_ball_in_roi(
+        gray, prior_xy, search_half=search_half,
+        min_r=min_r, max_r=max_r,
+    )
+    if xy is not None:
+        return xy, "hough", 1.0
+    if template is None:
+        return None
+    step = template_track_step(gray, template, prior_xy, search_half)
+    if step is None:
+        return None
+    xy, score = step
+    return xy, "ncc", float(score)
+
+
+def polar_angle_from_fixed(
+    fixed_pt: np.ndarray,
+    tip_pt: np.ndarray,
+    axis_dir: np.ndarray | None = None,
+) -> float:
+    """Signed angle (degrees) from the rest-axis direction to the vector
+    ``fixed_pt → tip_pt``. ``axis_dir`` defaults to the horizontal -x
+    direction (legacy behaviour) when not supplied."""
+    v = np.asarray(tip_pt, dtype=np.float64) - np.asarray(fixed_pt, dtype=np.float64)
+    if axis_dir is None:
+        axis_dir = np.array([-1.0, 0.0], dtype=np.float64)
+    return signed_angle_from_axis(np.asarray(axis_dir, dtype=np.float64), v)
+
+
+def _dashed_line(img, p1, p2, color, thickness=2, dash=10, gap=6):
+    """Draw a dashed line from p1 to p2 on `img` (cv2 has no native dashed
+    line)."""
+    p1 = np.asarray(p1, dtype=np.float64)
+    p2 = np.asarray(p2, dtype=np.float64)
+    v = p2 - p1
+    length = float(np.linalg.norm(v))
+    if length < 1e-6:
+        return
+    unit = v / length
+    step = dash + gap
+    n_dashes = int(length // step) + 1
+    for i in range(n_dashes):
+        a = p1 + unit * (i * step)
+        b = p1 + unit * min(i * step + dash, length)
+        cv2.line(img, tuple(a.astype(int)), tuple(b.astype(int)),
+                 color, thickness)
+
+
+def annotate_frame(frame_bgr, pts, measurement, t_s, frame_idx,
+                   fixed_pt=None, axis_dir=None):
     out = frame_bgr.copy()
     if pts is not None and len(pts):
         for p in pts.astype(int):
             cv2.circle(out, tuple(p), 1, (0, 200, 255), -1)
+    fp = fixed_pt if fixed_pt is not None else (
+        measurement.get("fixed_pt") if measurement is not None else None
+    )
+    ad = axis_dir if axis_dir is not None else (
+        measurement.get("axis_dir") if measurement is not None else None
+    )
+    if fp is not None:
+        # Rest axis through FP (faint white dashed line) drawn along the
+        # rod's natural direction — not horizontal — so the reference
+        # geometry matches the rod's tilt in the frame.
+        h, w = out.shape[:2]
+        ad_vec = (np.asarray(ad, dtype=np.float64)
+                  if ad is not None else np.array([-1.0, 0.0]))
+        diag = float(np.hypot(w, h))
+        p_a = np.asarray(fp, dtype=np.float64) + ad_vec * diag
+        p_b = np.asarray(fp, dtype=np.float64) - ad_vec * diag
+        _dashed_line(
+            out, tuple(p_a.astype(int)), tuple(p_b.astype(int)),
+            (200, 200, 200), thickness=1, dash=14, gap=10,
+        )
     if measurement is not None:
-        for p in measurement["base_pts"].astype(int):
-            cv2.circle(out, tuple(p), 2, (0, 255, 0), -1)
         for p in measurement["tip_pts"].astype(int):
             cv2.circle(out, tuple(p), 2, (0, 0, 255), -1)
-        bc = measurement["base_centroid"]
-        tc = measurement["tip_centroid"]
-        db = measurement["base_dir"]
-        dt = measurement["tip_dir"]
-        L = 80
-        cv2.arrowedLine(
-            out,
-            tuple((bc - db * L * 0.3).astype(int)),
-            tuple((bc + db * L).astype(int)),
-            (0, 255, 0), 2, tipLength=0.25,
-        )
-        cv2.arrowedLine(
-            out,
-            tuple((tc - dt * L * 0.3).astype(int)),
-            tuple((tc + dt * L).astype(int)),
-            (0, 0, 255), 2, tipLength=0.25,
-        )
         nb = measurement.get("needle_base_end")
         nt = measurement.get("needle_tip_end")
         nm = measurement.get("needle_midpoint")
@@ -900,18 +1220,38 @@ def annotate_frame(frame_bgr, pts, measurement, t_s, frame_idx):
             )
         if nm is not None:
             mp = tuple(np.asarray(nm).astype(int))
-            cv2.circle(out, mp, 8, (0, 255, 255), 2)
-            cv2.drawMarker(out, mp, (0, 255, 255), cv2.MARKER_CROSS, 14, 2)
+            cv2.circle(out, mp, 6, (0, 255, 255), 1)
         if measurement.get("ball_center") is not None:
             bc_pt = tuple(np.asarray(measurement["ball_center"]).astype(int))
-            cv2.drawMarker(out, bc_pt, (255, 0, 0), cv2.MARKER_CROSS, 14, 2)
+            cv2.drawMarker(out, bc_pt, (255, 80, 80), cv2.MARKER_CROSS, 16, 2)
+
+        # FP -> tip dashed line: the line whose angle from horizontal is the
+        # reported `bend`.
+        tip = measurement.get("tip_pt")
+        if fp is not None and tip is not None:
+            _dashed_line(
+                out,
+                tuple(np.asarray(fp)),
+                tuple(np.asarray(tip)),
+                (0, 255, 255), thickness=2, dash=10, gap=6,
+            )
+        if fp is not None:
+            fpt = tuple(np.asarray(fp).astype(int))
+            cv2.circle(out, fpt, 9, (255, 255, 255), 2)
+            cv2.circle(out, fpt, 3, (255, 255, 255), -1)
+            cv2.putText(out, "FP", (fpt[0] + 12, fpt[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
         ang = measurement["angle_deg"]
         cv2.rectangle(out, (5, 5), (280, 70), (0, 0, 0), -1)
-        cv2.putText(out, f"bend = {ang:6.2f} deg", (12, 32),
+        cv2.putText(out, f"angle = {ang:7.2f} deg", (12, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         cv2.putText(out, f"t = {t_s:6.2f} s  f={frame_idx}", (12, 58),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
     else:
+        if fp is not None:
+            fpt = tuple(np.asarray(fp).astype(int))
+            cv2.circle(out, fpt, 9, (255, 255, 255), 2)
         cv2.rectangle(out, (5, 5), (280, 40), (0, 0, 0), -1)
         cv2.putText(out, "no detection", (12, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -927,7 +1267,39 @@ def process_video(
     base_frac: float = 0.3,
     tip_frac: float = 0.15,
     show_progress: bool = False,
+    fixed_pt: np.ndarray | None = None,
+    axis_dir: np.ndarray | None = None,
+    tracked_pt_init: np.ndarray | None = None,
+    template_half: int = 20,
+    search_half: int = 80,
 ):
+    # FP, axis_dir, tracked_pt_init come from the user (interactive picker
+    # or CLI). If any are missing, fall back to auto-calibration (ball
+    # centre = FP, anchor→FP = axis, ball centre also seeds the tracker).
+    if fixed_pt is None or axis_dir is None or tracked_pt_init is None:
+        cal = calibrate_fixed_point(in_path, threshold)
+        if cal is None:
+            raise SystemExit(
+                "could not auto-calibrate — pass --pick or --fp-x/--fp-y "
+                "--axis-x/--axis-y --track-x/--track-y explicitly"
+            )
+        if fixed_pt is None:
+            fixed_pt = cal[0]
+        if axis_dir is None:
+            axis_dir = cal[1]
+        if tracked_pt_init is None:
+            tracked_pt_init = cal[0].copy()
+    axis_dir = np.asarray(axis_dir, dtype=np.float64)
+    axis_dir = axis_dir / max(float(np.linalg.norm(axis_dir)), 1e-9)
+    tracked_pt_init = np.asarray(tracked_pt_init, dtype=np.float64)
+    if show_progress:
+        print(
+            f"FP: ({fixed_pt[0]:.2f}, {fixed_pt[1]:.2f})  "
+            f"axis_dir: ({axis_dir[0]:+.3f}, {axis_dir[1]:+.3f})  "
+            f"track0: ({tracked_pt_init[0]:.2f}, {tracked_pt_init[1]:.2f})",
+            file=sys.stderr,
+        )
+
     cap = cv2.VideoCapture(str(in_path))
     if not cap.isOpened():
         raise SystemExit(f"cannot open {in_path}")
@@ -945,6 +1317,8 @@ def process_video(
     t0 = time.time()
     last_log = t0
     idx = 0
+    last_tracked_xy: np.ndarray = tracked_pt_init.copy()
+    template_patch: np.ndarray | None = None  # initialised from frame 0
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -991,14 +1365,41 @@ def process_video(
                 if measurement is not None:
                     ordered = curv_path
                     m.n_skeleton = len(curv_path)
-        if measurement is not None:
-            m.angle_deg = measurement["angle_deg"]
-            m.tip_x = float(measurement["tip_pt"][0])
-            m.tip_y = float(measurement["tip_pt"][1])
-            m.base_x = float(measurement["base_centroid"][0])
-            m.base_y = float(measurement["base_centroid"][1])
-            m.base_dir_deg = direction_angle_deg(measurement["base_dir"])
-            m.tip_dir_deg = direction_angle_deg(measurement["tip_dir"])
+        # Current tip = user-chosen tracked point, located each frame by
+        # normalised cross-correlation against a template extracted on
+        # frame 0. Search is restricted to a window around the previous
+        # location so the tracker is fast and robust.
+        if template_patch is None:
+            ex = template_extract(gray, tracked_pt_init, template_half)
+            if ex is not None:
+                template_patch, _ = ex
+        tip_pt: np.ndarray | None = None
+        if template_patch is not None:
+            step = template_track_step(
+                gray, template_patch, last_tracked_xy, search_half,
+            )
+            if step is not None:
+                tip_pt, _ = step
+                last_tracked_xy = tip_pt.copy()
+        if tip_pt is not None:
+            angle = polar_angle_from_fixed(fixed_pt, tip_pt, axis_dir)
+            if measurement is None:
+                measurement = {}
+            measurement["angle_deg"] = angle
+            measurement["fixed_pt"] = fixed_pt
+            measurement["axis_dir"] = axis_dir
+            measurement["tip_pt"] = tip_pt
+            measurement.setdefault("tip_pts", np.empty((0, 2), dtype=np.float64))
+
+            m.angle_deg = angle
+            m.tip_x = float(tip_pt[0])
+            m.tip_y = float(tip_pt[1])
+            m.base_x = float(fixed_pt[0])
+            m.base_y = float(fixed_pt[1])
+            if "base_dir" in measurement:
+                m.base_dir_deg = direction_angle_deg(measurement["base_dir"])
+            if "tip_dir" in measurement:
+                m.tip_dir_deg = direction_angle_deg(measurement["tip_dir"])
             nm = measurement.get("needle_midpoint")
             if nm is not None:
                 m.mid_x = float(nm[0])
@@ -1007,7 +1408,9 @@ def process_video(
             if nl is not None:
                 m.needle_len = float(nl)
         rows.append(m)
-        writer.write(annotate_frame(frame, ordered, measurement, t_s, idx))
+        writer.write(annotate_frame(
+            frame, ordered, measurement, t_s, idx, fixed_pt, axis_dir,
+        ))
 
         if show_progress and time.time() - last_log > 1.0:
             done = idx + 1
@@ -1066,7 +1469,61 @@ def main():
     ap.add_argument("--base-frac", type=float, default=0.3)
     ap.add_argument("--tip-frac", type=float, default=0.15)
     ap.add_argument("--show-progress", action="store_true")
+    ap.add_argument(
+        "--pick", action="store_true",
+        help="Open frame 0 and pick (1) fixed point, (2) axis-end point, "
+             "(3) tracked point by mouse click.",
+    )
+    ap.add_argument("--fp-x", type=float, default=None,
+                    help="x of fixed reference point.")
+    ap.add_argument("--fp-y", type=float, default=None,
+                    help="y of fixed reference point.")
+    ap.add_argument("--axis-x", type=float, default=None,
+                    help="x of a second point along the reference axis "
+                         "(FP→this defines axis_dir).")
+    ap.add_argument("--axis-y", type=float, default=None,
+                    help="y of the axis-end point.")
+    ap.add_argument("--track-x", type=float, default=None,
+                    help="x of the point on the structure to track (initial).")
+    ap.add_argument("--track-y", type=float, default=None,
+                    help="y of the initial tracked point.")
+    ap.add_argument("--template-half", type=int, default=20,
+                    help="Half-size of the template patch around the "
+                         "tracked point (default: 20 = 41x41 patch).")
+    ap.add_argument("--search-half", type=int, default=80,
+                    help="Half-size of the per-frame search window "
+                         "around the previous tracked location.")
     args = ap.parse_args()
+
+    fixed_pt = None
+    axis_dir = None
+    tracked_pt_init = None
+    if args.pick:
+        picked = pick_geometry_interactive(args.video)
+        if picked is None:
+            ap.error("picking cancelled")
+        fixed_pt, axis_dir, tracked_pt_init = picked
+    if args.fp_x is not None or args.fp_y is not None:
+        if args.fp_x is None or args.fp_y is None:
+            ap.error("--fp-x and --fp-y must be given together")
+        fixed_pt = np.array([args.fp_x, args.fp_y], dtype=np.float64)
+    if args.axis_x is not None or args.axis_y is not None:
+        if args.axis_x is None or args.axis_y is None:
+            ap.error("--axis-x and --axis-y must be given together")
+        if fixed_pt is None:
+            ap.error("--axis-x/--axis-y requires --fp-x/--fp-y")
+        v = np.array([args.axis_x - fixed_pt[0],
+                      args.axis_y - fixed_pt[1]], dtype=np.float64)
+        nrm = float(np.linalg.norm(v))
+        if nrm < 1.0:
+            ap.error("axis end coincides with FP")
+        axis_dir = v / nrm
+    if args.track_x is not None or args.track_y is not None:
+        if args.track_x is None or args.track_y is None:
+            ap.error("--track-x and --track-y must be given together")
+        tracked_pt_init = np.array([args.track_x, args.track_y],
+                                   dtype=np.float64)
+
     process_video(
         in_path=args.video,
         out_csv=args.out_csv,
@@ -1076,6 +1533,11 @@ def main():
         base_frac=args.base_frac,
         tip_frac=args.tip_frac,
         show_progress=args.show_progress,
+        fixed_pt=fixed_pt,
+        axis_dir=axis_dir,
+        tracked_pt_init=tracked_pt_init,
+        template_half=args.template_half,
+        search_half=args.search_half,
     )
 
 
