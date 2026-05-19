@@ -1078,6 +1078,135 @@ def template_track_step(
     return np.array([cx, cy], dtype=np.float64), float(score)
 
 
+def init_rigid_arm_tracker(
+    gray_first: np.ndarray,
+    fp: np.ndarray,
+    track_init: np.ndarray,
+    ball_hint: np.ndarray | None = None,
+    ball_search_half: int = 160,
+    min_r: int = 10,
+    max_r: int = 60,
+) -> dict | None:
+    """Set up a rigid-arm tracker that follows the user-picked tip point
+    by detecting the ball each frame and applying the same rigid rotation
+    about FP.
+
+    Records: initial ball position, the tip's distance from FP (conserved
+    by rigid rotation), and the constant angular offset between FP→ball
+    and FP→tip. Subsequent frames re-detect the ball, recover the arm's
+    rotation angle, and reconstruct the tip position by rotating back.
+
+    Returns the state dict or ``None`` if the ball can't be detected on
+    the first frame."""
+    fp = np.asarray(fp, dtype=np.float64)
+    track_init = np.asarray(track_init, dtype=np.float64)
+    if ball_hint is not None:
+        ball = track_ball_in_roi(
+            gray_first, ball_hint, search_half=ball_search_half,
+            min_r=min_r, max_r=max_r,
+        )
+    else:
+        # Search around the user's tip click (the ball sits adjacent to it)
+        ball = track_ball_in_roi(
+            gray_first, track_init, search_half=ball_search_half,
+            min_r=min_r, max_r=max_r,
+        )
+    if ball is None:
+        ball = detect_ball_hough(gray_first)
+    if ball is None:
+        return None
+    ball_xy = np.asarray(ball[:2], dtype=np.float64)
+    v_ball = ball_xy - fp
+    v_track = track_init - fp
+    r_track = float(np.linalg.norm(v_track))
+    r_ball = float(np.linalg.norm(v_ball))
+    if r_track < 1e-3 or r_ball < 1e-3:
+        return None
+    ang_ball0 = float(np.arctan2(-v_ball[1], v_ball[0]))
+    ang_track0 = float(np.arctan2(-v_track[1], v_track[0]))
+    phi_offset = ang_track0 - ang_ball0
+    return {
+        "fp": fp,
+        "r_track": r_track,
+        "phi_offset": phi_offset,
+        "last_ball_xy": ball_xy.copy(),
+        "min_r": int(min_r),
+        "max_r": int(max_r),
+    }
+
+
+def step_rigid_arm_tracker(
+    gray: np.ndarray,
+    state: dict,
+    search_half: int = 120,
+) -> np.ndarray | None:
+    """Locate the ball in this frame (Hough circles in an ROI around the
+    last known position) and reconstruct the tip position by applying the
+    same angular displacement to the rigid arm. Updates state in place.
+
+    Returns the tip ``(x, y)`` in image coords, or ``None`` if the ball
+    isn't found this frame (caller can hold the previous estimate)."""
+    ball = track_ball_in_roi(
+        gray, state["last_ball_xy"], search_half=search_half,
+        min_r=state["min_r"], max_r=state["max_r"],
+    )
+    if ball is None:
+        return None
+    fp = state["fp"]
+    v_ball = ball - fp
+    ang_ball = float(np.arctan2(-v_ball[1], v_ball[0]))
+    ang_track = ang_ball + state["phi_offset"]
+    state["last_ball_xy"] = ball.copy()
+    return np.array(
+        [fp[0] + state["r_track"] * np.cos(ang_track),
+         fp[1] - state["r_track"] * np.sin(ang_track)],
+        dtype=np.float64,
+    )
+
+
+def lk_track_step(
+    prev_gray: np.ndarray,
+    gray: np.ndarray,
+    prev_xy: np.ndarray,
+    win_size: int = 31,
+    max_level: int = 4,
+) -> tuple[np.ndarray, float] | None:
+    """Single-point Lucas-Kanade pyramidal optical flow. Tracks the exact
+    pixel the user picked from ``prev_gray`` into ``gray`` with sub-pixel
+    precision. Returns ``(new_xy, err)`` or ``None`` if LK loses the point."""
+    pts = np.array([[[float(prev_xy[0]), float(prev_xy[1])]]],
+                   dtype=np.float32).reshape(1, 1, 2)
+    nxt, st, err = cv2.calcOpticalFlowPyrLK(
+        prev_gray, gray, pts, None,
+        winSize=(win_size, win_size), maxLevel=max_level,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        minEigThreshold=1e-4,
+    )
+    if st is None or st[0, 0] == 0:
+        return None
+    new_xy = np.array([float(nxt[0, 0, 0]), float(nxt[0, 0, 1])],
+                      dtype=np.float64)
+    err_val = float(err[0, 0]) if err is not None else 0.0
+    return new_xy, err_val
+
+
+def project_to_rigid_radius(
+    xy: np.ndarray,
+    fp: np.ndarray,
+    fixed_radius: float,
+) -> np.ndarray:
+    """Project ``xy`` onto a circle of radius ``fixed_radius`` centred at
+    ``fp``. The tracked point sits on a rigid section of the wire that
+    rotates about FP, so its distance from FP is conserved — projecting
+    radially each frame eliminates radial tracker drift and locks the
+    motion to the physical degree of freedom (rotation only)."""
+    v = xy - fp
+    r = float(np.linalg.norm(v))
+    if r < 1e-6:
+        return xy.copy()
+    return (fp + (v / r) * fixed_radius).astype(np.float64)
+
+
 def track_ball_in_roi(
     gray: np.ndarray,
     prior_xy: np.ndarray,

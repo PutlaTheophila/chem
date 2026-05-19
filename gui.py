@@ -259,9 +259,17 @@ class WireBendGUI:
 
         template_half = int(self.tmpl_var.get())
         search_half = int(self.search_var.get())
-        use_hough = bool(self.snap_ball_var.get())
         template_patch = None
         last_xy = tracked_pt_init.copy()
+        prev_gray: np.ndarray | None = None
+        fixed_radius = float(np.linalg.norm(tracked_pt_init - fp))
+        # Rigid-arm tracker (primary). The whole tip section (ball + the
+        # short wire adjacent to it) rotates rigidly about FP, so we track
+        # the BALL each frame (highly reliable Hough-circle detection) and
+        # reconstruct the user-picked tip position by applying the same
+        # rotation to the arm. This is much more robust than chasing a
+        # feature pixel on a featureless dark wire.
+        arm_state: dict | None = None
         rows: list[tuple[int, float, float | None, float | None, float | None]] = []
         last_log = time.time()
         idx = 0
@@ -271,40 +279,44 @@ class WireBendGUI:
                 break
             t_s = idx / fps
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if arm_state is None:
+                arm_state = analyzer.init_rigid_arm_tracker(
+                    gray, fp, tracked_pt_init,
+                    ball_search_half=max(search_half, 160),
+                )
             if template_patch is None:
                 ex = analyzer.template_extract(gray, tracked_pt_init, template_half)
                 if ex is not None:
                     template_patch = ex[0]
-            # Track the exact user-chosen point via NCC template matching
-            # with adaptive refresh. Only fall back to Hough-circle ball
-            # detection when the user explicitly asked to snap to the ball
-            # (otherwise the tracker would always drag to the ball centre
-            # even when the user picked the wire tip just outside the ball).
             tip = None
-            if use_hough:
-                res = analyzer.track_step_robust(
-                    gray, template_patch, last_xy, search_half=search_half,
+            if arm_state is not None:
+                tip = analyzer.step_rigid_arm_tracker(
+                    gray, arm_state, search_half=search_half,
                 )
-                if res is not None:
-                    tip, _, score = res
+                if tip is not None:
                     last_xy = tip.copy()
-                    ex = analyzer.template_extract(gray, tip, template_half)
-                    if ex is not None:
-                        template_patch = ex[0]
-            elif template_patch is not None:
+            # Fallback chain when the ball detector loses lock on a frame:
+            # LK on the previously tracked pixel, then template NCC. Both
+            # are projected onto the rigid-arm radius to keep the tip on
+            # its physical circular path.
+            if tip is None and prev_gray is not None:
+                lk = analyzer.lk_track_step(prev_gray, gray, last_xy)
+                if lk is not None:
+                    tip = analyzer.project_to_rigid_radius(lk[0], fp, fixed_radius)
+                    last_xy = tip.copy()
+            if tip is None and template_patch is not None:
                 step = analyzer.template_track_step(
                     gray, template_patch, last_xy, search_half,
                 )
                 if step is not None:
-                    tip, score = step
+                    raw, score = step
+                    tip = analyzer.project_to_rigid_radius(raw, fp, fixed_radius)
                     last_xy = tip.copy()
-                    # Refresh template on high-confidence matches so the
-                    # tracker adapts to slow appearance changes (rotation,
-                    # lighting) as the wire bends.
                     if score > 0.85:
                         ex = analyzer.template_extract(gray, tip, template_half)
                         if ex is not None:
                             template_patch = ex[0]
+            prev_gray = gray
             angle = None
             if tip is not None:
                 angle = analyzer.polar_angle_from_fixed(fp, tip, axis_dir)
