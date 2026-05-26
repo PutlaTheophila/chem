@@ -82,6 +82,21 @@ class WireBendGUI:
         ttk.Checkbutton(tb, text="Snap track→ball", variable=self.snap_ball_var).pack(
             side=tk.LEFT, padx=(10, 0)
         )
+        # When ON, the per-frame angle is the angle between the axis and
+        # the needle's LOCAL TANGENT at the tracked tip (PCA on a skeleton
+        # patch around the tip). When OFF, falls back to the legacy chord
+        # angle (axis vs FP→tip). The tangent is much closer to the real
+        # bend angle when the wire is curved past the ball.
+        self.tangent_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tb, text="Tangent angle", variable=self.tangent_var).pack(
+            side=tk.LEFT, padx=(10, 0)
+        )
+        ttk.Label(tb, text="Tan win:").pack(side=tk.LEFT, padx=(10, 2))
+        self.tan_win_var = tk.IntVar(value=40)
+        ttk.Spinbox(tb, from_=10, to=200, textvariable=self.tan_win_var, width=4).pack(side=tk.LEFT)
+        ttk.Label(tb, text="Tan rad:").pack(side=tk.LEFT, padx=(6, 2))
+        self.tan_rad_var = tk.IntVar(value=18)
+        ttk.Spinbox(tb, from_=4, to=80, textvariable=self.tan_rad_var, width=4).pack(side=tk.LEFT)
 
         body = ttk.Frame(self.root)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -318,8 +333,26 @@ class WireBendGUI:
                             template_patch = ex[0]
             prev_gray = gray
             angle = None
+            tangent_dir = None  # unit-vector pointing AWAY from FP, when fit succeeds
             if tip is not None:
-                angle = analyzer.polar_angle_from_fixed(fp, tip, axis_dir)
+                use_tangent = bool(self.tangent_var.get())
+                if use_tangent:
+                    fit = analyzer.local_needle_tangent(
+                        gray, tip,
+                        window_half=int(self.tan_win_var.get()),
+                        pca_radius=int(self.tan_rad_var.get()),
+                    )
+                    if fit is not None:
+                        _, t_dir = fit
+                        # Orient the tangent so it points from FP toward
+                        # the tip — keeps the sign convention consistent
+                        # with the chord-based fallback below.
+                        if float(np.dot(t_dir, tip - fp)) < 0.0:
+                            t_dir = -t_dir
+                        tangent_dir = t_dir
+                        angle = analyzer.signed_angle_from_axis(axis_dir, t_dir)
+                if angle is None:
+                    angle = analyzer.polar_angle_from_fixed(fp, tip, axis_dir)
             rows.append((idx, t_s,
                          None if tip is None else float(tip[0]),
                          None if tip is None else float(tip[1]),
@@ -329,6 +362,7 @@ class WireBendGUI:
                 measurement = {
                     "angle_deg": angle, "fixed_pt": fp, "axis_dir": axis_dir,
                     "tip_pt": tip, "tip_pts": np.empty((0, 2), dtype=np.float64),
+                    "tangent_dir": tangent_dir,
                 }
             writer.write(analyzer.annotate_frame(
                 frame, None, measurement, t_s, idx, fp, axis_dir,

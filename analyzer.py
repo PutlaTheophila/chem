@@ -1275,6 +1275,82 @@ def track_step_robust(
     return xy, "ncc", float(score)
 
 
+def local_needle_tangent(
+    gray: np.ndarray,
+    click_xy: np.ndarray,
+    window_half: int = 40,
+    pca_radius: int = 18,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Fit a unit-tangent vector to the needle near ``click_xy``.
+
+    Crops a window of half-size ``window_half`` around the click, Otsu-
+    thresholds both polarities (the needle may be bright OR dark relative
+    to its background), takes the connected component nearest the click
+    in each, skeletonises it, and PCA-fits a direction to skeleton pixels
+    within ``pca_radius`` of the click. Returns (centroid, unit_dir) or
+    None if no usable structure is found.
+    """
+    if gray.ndim != 2:
+        raise ValueError("local_needle_tangent expects a single-channel image")
+    h, w = gray.shape
+    cx, cy = float(click_xy[0]), float(click_xy[1])
+    x0 = int(max(0, round(cx) - window_half))
+    y0 = int(max(0, round(cy) - window_half))
+    x1 = int(min(w, round(cx) + window_half + 1))
+    y1 = int(min(h, round(cy) + window_half + 1))
+    if x1 - x0 < 6 or y1 - y0 < 6:
+        return None
+    patch = gray[y0:y1, x0:x1]
+    blur = cv2.GaussianBlur(patch, (3, 3), 0)
+    click_local = np.array([cx - x0, cy - y0])
+
+    best_pts: np.ndarray | None = None
+    best_count = 0
+    for invert in (False, True):
+        src = 255 - blur if invert else blur
+        _, bw = cv2.threshold(src, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        if bw.sum() == 0:
+            continue
+        n, labels = cv2.connectedComponents(bw)
+        if n <= 1:
+            continue
+        best_label = 0
+        best_d = float("inf")
+        for L in range(1, n):
+            ys, xs = np.where(labels == L)
+            if len(xs) == 0:
+                continue
+            d = float(np.min((xs - click_local[0]) ** 2 + (ys - click_local[1]) ** 2))
+            if d < best_d:
+                best_d = d
+                best_label = L
+        if best_label == 0:
+            continue
+        comp = (labels == best_label).astype(np.uint8)
+        sk = skeletonize(comp > 0).astype(np.uint8)
+        ys, xs = np.where(sk > 0)
+        if len(xs) < 6:
+            continue
+        pts = np.column_stack([xs + x0, ys + y0]).astype(np.float64)
+        inside = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) <= pca_radius
+        sub = pts[inside]
+        if len(sub) >= 6 and len(sub) > best_count:
+            best_count = len(sub)
+            best_pts = sub
+
+    if best_pts is None or len(best_pts) < 6:
+        return None
+    centroid = best_pts.mean(axis=0)
+    centred = best_pts - centroid
+    _, _, vh = np.linalg.svd(centred, full_matrices=False)
+    direction = vh[0]
+    n = float(np.linalg.norm(direction))
+    if n < 1e-9:
+        return None
+    return centroid, direction / n
+
+
 def polar_angle_from_fixed(
     fixed_pt: np.ndarray,
     tip_pt: np.ndarray,
@@ -1354,8 +1430,7 @@ def annotate_frame(frame_bgr, pts, measurement, t_s, frame_idx,
             bc_pt = tuple(np.asarray(measurement["ball_center"]).astype(int))
             cv2.drawMarker(out, bc_pt, (255, 80, 80), cv2.MARKER_CROSS, 16, 2)
 
-        # FP -> tip dashed line: the line whose angle from horizontal is the
-        # reported `bend`.
+        # FP -> tip dashed line: the chord (legacy reference geometry).
         tip = measurement.get("tip_pt")
         if fp is not None and tip is not None:
             _dashed_line(
@@ -1364,6 +1439,18 @@ def annotate_frame(frame_bgr, pts, measurement, t_s, frame_idx,
                 tuple(np.asarray(tip)),
                 (0, 255, 255), thickness=2, dash=10, gap=6,
             )
+        # Local tangent at the tip — when present, this is the line the
+        # reported angle was measured FROM (axis vs tangent). Solid green
+        # so it's visually distinct from the chord.
+        t_dir = measurement.get("tangent_dir") if measurement is not None else None
+        if tip is not None and t_dir is not None:
+            t_dir_arr = np.asarray(t_dir, dtype=np.float64)
+            h_, w_ = out.shape[:2]
+            diag = float(np.hypot(w_, h_))
+            p1 = np.asarray(tip, dtype=np.float64) - t_dir_arr * diag
+            p2 = np.asarray(tip, dtype=np.float64) + t_dir_arr * diag
+            cv2.line(out, tuple(p1.astype(int)), tuple(p2.astype(int)),
+                     (80, 255, 80), 2)
         if fp is not None:
             fpt = tuple(np.asarray(fp).astype(int))
             cv2.circle(out, fpt, 9, (255, 255, 255), 2)
